@@ -308,7 +308,7 @@ func New(opts ...Option) *http.Client {
 		allowPrivate:     cfg.allowPrivateRedirects,
 		strictInitial:    cfg.strictSSRFInitial,
 		sensitiveHeaders: cfg.sensitiveHeaders,
-		resolver:         cfg.resolver,
+		resolver:         cfg.lookuper(),
 		ipPolicyAtDial:   ipPolicyAtDial,
 	})
 
@@ -650,10 +650,11 @@ func (c *config) lookuper() ipLookuper {
 	return c.resolver
 }
 
-// WithLookupIPAddr sets the function gttp uses for the strict direct-mode dial
-// validation lookup (see WithDialContext), in place of WithResolver. Callers
-// that keep their own DNS cache can pass its lookup here so gttp shares the
-// cached answers instead of querying again.
+// WithLookupIPAddr sets the function gttp uses for the DNS lookups it makes
+// itself: the strict direct-mode dial validation (see WithDialContext) and the
+// redirect guard's IP-policy check. It takes precedence over WithResolver for
+// those lookups. Callers that keep their own DNS cache can pass its lookup here
+// so gttp shares the cached answers instead of querying again.
 //
 // It does not change how the default dialer resolves outside strict direct
 // mode; use WithResolver for that.
