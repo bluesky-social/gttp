@@ -3,18 +3,15 @@ package gttp
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
-
-type resolverFunc func(context.Context, string) ([]net.IPAddr, error)
-
-func (f resolverFunc) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
-	return f(ctx, host)
-}
 
 func TestIPPolicyDialResolvesOnceAndDialsValidatedLiteral(t *testing.T) {
 	var lookups atomic.Int32
@@ -256,5 +253,54 @@ func TestIPPolicyDialLiteralCGNATAndNAT64Blocked(t *testing.T) {
 				t.Fatal("dial called for blocked address literal")
 			}
 		})
+	}
+}
+
+// A caller with its own DNS cache passes its lookup to gttp so the two share
+// answers. In strict direct mode that lookup must be the one the dial is
+// validated against, and the request must still complete.
+func TestStrictDirectDialUsesLookupFunc(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(srv.Close)
+
+	var mu sync.Mutex
+	var looked, dialed []string
+	lookup := func(_ context.Context, host string) ([]net.IPAddr, error) {
+		mu.Lock()
+		looked = append(looked, host)
+		mu.Unlock()
+		return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
+	}
+	client := New(
+		WithStrictSSRFProtection(), WithNoProxy(), WithNoRetries(),
+		WithLookupIPAddr(lookup),
+		// Record the validated address, then connect to the local server.
+		WithDialContext(func(ctx context.Context, network, address string) (net.Conn, error) {
+			mu.Lock()
+			dialed = append(dialed, address)
+			mu.Unlock()
+			var d net.Dialer
+			return d.DialContext(ctx, network, srv.Listener.Addr().String())
+		}),
+	)
+
+	res, err := client.Get("http://cached.invalid/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if err != nil || string(body) != "ok" {
+		t.Fatalf("body = %q, err = %v", body, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(looked) != 1 || looked[0] != "cached.invalid" {
+		t.Fatalf("lookups = %v, want [cached.invalid]", looked)
+	}
+	if len(dialed) != 1 || dialed[0] != "203.0.113.10:80" {
+		t.Fatalf("dialed = %v, want [203.0.113.10:80]", dialed)
 	}
 }

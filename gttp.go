@@ -92,6 +92,7 @@ type config struct {
 	http2PingTimeout       time.Duration
 	dialContext            func(ctx context.Context, network, address string) (net.Conn, error)
 	resolver               *net.Resolver
+	lookupIPAddr           func(ctx context.Context, host string) ([]net.IPAddr, error)
 	proxy                  func(*http.Request) (*url.URL, error)
 	disableProxy           bool
 
@@ -251,7 +252,7 @@ func New(opts ...Option) *http.Client {
 		// exception cannot be expressed at connection scope, so those clients
 		// retain request-time preflight instead.
 		if cfg.strictSSRFInitial && cfg.disableProxy && !cfg.allowPrivateRedirects {
-			dialCtx = newIPPolicyDialContext(cfg.resolver, dialCtx, staggeredFallback)
+			dialCtx = newIPPolicyDialContext(cfg.lookuper(), dialCtx, staggeredFallback)
 		}
 
 		proxyFn := http.ProxyFromEnvironment
@@ -639,6 +640,25 @@ func WithDialContext(fn func(ctx context.Context, network, address string) (net.
 // WithDialContext for details.
 func WithResolver(r *net.Resolver) Option {
 	return func(c *config) { c.resolver = r }
+}
+
+// lookuper returns the lookup behind gttp's own IP-policy checks.
+func (c *config) lookuper() ipLookuper {
+	if c.lookupIPAddr != nil {
+		return resolverFunc(c.lookupIPAddr)
+	}
+	return c.resolver
+}
+
+// WithLookupIPAddr sets the function gttp uses for the strict direct-mode dial
+// validation lookup (see WithDialContext), in place of WithResolver. Callers
+// that keep their own DNS cache can pass its lookup here so gttp shares the
+// cached answers instead of querying again.
+//
+// It does not change how the default dialer resolves outside strict direct
+// mode; use WithResolver for that.
+func WithLookupIPAddr(fn func(ctx context.Context, host string) ([]net.IPAddr, error)) Option {
+	return func(c *config) { c.lookupIPAddr = fn }
 }
 
 // WithProxy sets a custom proxy function for the transport.
