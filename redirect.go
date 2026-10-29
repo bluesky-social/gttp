@@ -17,6 +17,13 @@ type ipLookuper interface {
 	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
 }
 
+// resolverFunc adapts a lookup function to ipLookuper.
+type resolverFunc func(context.Context, string) ([]net.IPAddr, error)
+
+func (f resolverFunc) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return f(ctx, host)
+}
+
 // normalizeURL returns a canonical string form of u for loop detection.
 // Applies RFC 3986 §6.2 syntax-based equivalence plus default-port stripping
 // and query-parameter ordering.

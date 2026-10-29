@@ -92,6 +92,7 @@ type config struct {
 	http2PingTimeout       time.Duration
 	dialContext            func(ctx context.Context, network, address string) (net.Conn, error)
 	resolver               *net.Resolver
+	lookupIPAddr           func(ctx context.Context, host string) ([]net.IPAddr, error)
 	proxy                  func(*http.Request) (*url.URL, error)
 	disableProxy           bool
 
@@ -251,7 +252,7 @@ func New(opts ...Option) *http.Client {
 		// exception cannot be expressed at connection scope, so those clients
 		// retain request-time preflight instead.
 		if cfg.strictSSRFInitial && cfg.disableProxy && !cfg.allowPrivateRedirects {
-			dialCtx = newIPPolicyDialContext(cfg.resolver, dialCtx, staggeredFallback)
+			dialCtx = newIPPolicyDialContext(cfg.lookuper(), dialCtx, staggeredFallback)
 		}
 
 		proxyFn := http.ProxyFromEnvironment
@@ -307,7 +308,7 @@ func New(opts ...Option) *http.Client {
 		allowPrivate:     cfg.allowPrivateRedirects,
 		strictInitial:    cfg.strictSSRFInitial,
 		sensitiveHeaders: cfg.sensitiveHeaders,
-		resolver:         cfg.resolver,
+		resolver:         cfg.lookuper(),
 		ipPolicyAtDial:   ipPolicyAtDial,
 	})
 
@@ -632,13 +633,38 @@ func WithDialContext(fn func(ctx context.Context, network, address string) (net.
 //	    },
 //	}))
 //
-// This option is ignored when WithTransport is used, and when WithDialContext
-// is used outside strict direct mode. In strict direct mode
+// The dialer does not use it when WithTransport is used, or when
+// WithDialContext is used outside strict direct mode. In strict direct mode
 // (WithStrictSSRFProtection and WithNoProxy without WithAllowPrivateRedirects)
 // it drives the validation lookup even alongside WithDialContext; see
 // WithDialContext for details.
+//
+// Independently of the dial, the redirect guard resolves each redirect target
+// with this resolver to check the IP policy, including alongside
+// WithDialContext or WithTransport. WithLookupIPAddr takes precedence for
+// both of gttp's own lookups.
 func WithResolver(r *net.Resolver) Option {
 	return func(c *config) { c.resolver = r }
+}
+
+// lookuper returns the lookup behind gttp's own IP-policy checks.
+func (c *config) lookuper() ipLookuper {
+	if c.lookupIPAddr != nil {
+		return resolverFunc(c.lookupIPAddr)
+	}
+	return c.resolver
+}
+
+// WithLookupIPAddr sets the function gttp uses for the DNS lookups it makes
+// itself: the strict direct-mode dial validation (see WithDialContext) and the
+// redirect guard's IP-policy check. It takes precedence over WithResolver for
+// those lookups. Callers that keep their own DNS cache can pass its lookup here
+// so gttp shares the cached answers instead of querying again.
+//
+// It does not change how the default dialer resolves outside strict direct
+// mode; use WithResolver for that.
+func WithLookupIPAddr(fn func(ctx context.Context, host string) ([]net.IPAddr, error)) Option {
+	return func(c *config) { c.lookupIPAddr = fn }
 }
 
 // WithProxy sets a custom proxy function for the transport.

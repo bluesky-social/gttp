@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -552,5 +553,117 @@ func TestSSRFMultiIPAllPublicPasses(t *testing.T) {
 	})
 	if err := g.checkIPPolicy(context.Background(), "cdn.example.com"); err != nil {
 		t.Errorf("err = %v, want nil", err)
+	}
+}
+
+// The redirect guard's IP-policy lookup must go through WithLookupIPAddr too,
+// and the policy must still apply to the answers it returns.
+func TestRedirectGuardUsesLookupFunc(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host == "a.invalid" {
+			http.Redirect(w, r, "http://b.invalid/", http.StatusFound)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	t.Cleanup(srv.Close)
+
+	newClient := func(answer string, looked *[]string) *http.Client {
+		var mu sync.Mutex
+		return New(
+			WithNoRetries(), WithNoProxy(),
+			WithLookupIPAddr(func(_ context.Context, host string) ([]net.IPAddr, error) {
+				mu.Lock()
+				*looked = append(*looked, host)
+				mu.Unlock()
+				return []net.IPAddr{{IP: net.ParseIP(answer)}}, nil
+			}),
+			// Outside strict mode the dialer gets hostnames; send them all to
+			// the local server, which routes on the Host header.
+			WithDialContext(func(ctx context.Context, network, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, srv.Listener.Addr().String())
+			}),
+		)
+	}
+
+	t.Run("public answer follows the redirect", func(t *testing.T) {
+		var looked []string
+		res, err := newClient("203.0.113.10", &looked).Get("http://a.invalid/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		if err != nil || string(body) != "ok" {
+			t.Fatalf("body = %q, err = %v", body, err)
+		}
+		if len(looked) != 1 || looked[0] != "b.invalid" {
+			t.Fatalf("lookups = %v, want [b.invalid]", looked)
+		}
+	})
+
+	t.Run("private answer is blocked", func(t *testing.T) {
+		var looked []string
+		res, err := newClient("10.0.0.1", &looked).Get("http://a.invalid/")
+		if res != nil {
+			_ = res.Body.Close()
+		}
+		if !errors.Is(err, ErrBlockedByIPPolicy) {
+			t.Fatalf("err = %v, want ErrBlockedByIPPolicy", err)
+		}
+		if len(looked) != 1 || looked[0] != "b.invalid" {
+			t.Fatalf("lookups = %v, want [b.invalid]", looked)
+		}
+	})
+}
+
+// WithResolver drives the redirect guard's lookup even where it cannot
+// affect the dial: alongside WithDialContext outside strict mode, and with
+// WithTransport.
+func TestWithResolverDrivesRedirectGuard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://b.invalid/", http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	toServer := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+
+	// The resolver refuses every query, so a redirect that goes through it
+	// fails, and the recorded dials show it was asked.
+	newResolver := func(asked *atomic.Int32) *net.Resolver {
+		return &net.Resolver{
+			PreferGo: true,
+			Dial: func(context.Context, string, string) (net.Conn, error) {
+				asked.Add(1)
+				return nil, errors.New("test resolver refused")
+			},
+		}
+	}
+
+	for name, opt := range map[string]func(*net.Resolver) []Option{
+		"with WithDialContext": func(r *net.Resolver) []Option {
+			return []Option{WithNoProxy(), WithDialContext(toServer), WithResolver(r)}
+		},
+		"with WithTransport": func(r *net.Resolver) []Option {
+			return []Option{WithTransport(&http.Transport{DialContext: toServer}), WithResolver(r)}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var asked atomic.Int32
+			opts := append(opt(newResolver(&asked)), WithNoRetries())
+			res, err := New(opts...).Get("http://a.invalid/")
+			if res != nil {
+				_ = res.Body.Close()
+			}
+			if !errors.Is(err, ErrBlockedByIPPolicy) {
+				t.Fatalf("err = %v, want ErrBlockedByIPPolicy", err)
+			}
+			if asked.Load() == 0 {
+				t.Fatal("redirect lookup did not use the configured resolver")
+			}
+		})
 	}
 }
