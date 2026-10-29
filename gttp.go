@@ -633,11 +633,16 @@ func WithDialContext(fn func(ctx context.Context, network, address string) (net.
 //	    },
 //	}))
 //
-// This option is ignored when WithTransport is used, and when WithDialContext
-// is used outside strict direct mode. In strict direct mode
+// The dialer does not use it when WithTransport is used, or when
+// WithDialContext is used outside strict direct mode. In strict direct mode
 // (WithStrictSSRFProtection and WithNoProxy without WithAllowPrivateRedirects)
 // it drives the validation lookup even alongside WithDialContext; see
 // WithDialContext for details.
+//
+// Independently of the dial, the redirect guard resolves each redirect target
+// with this resolver to check the IP policy, including alongside
+// WithDialContext or WithTransport. WithLookupIPAddr takes precedence for
+// both of gttp's own lookups.
 func WithResolver(r *net.Resolver) Option {
 	return func(c *config) { c.resolver = r }
 }

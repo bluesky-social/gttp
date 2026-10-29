@@ -617,3 +617,53 @@ func TestRedirectGuardUsesLookupFunc(t *testing.T) {
 		}
 	})
 }
+
+// WithResolver drives the redirect guard's lookup even where it cannot
+// affect the dial: alongside WithDialContext outside strict mode, and with
+// WithTransport.
+func TestWithResolverDrivesRedirectGuard(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://b.invalid/", http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	toServer := func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, srv.Listener.Addr().String())
+	}
+
+	// The resolver refuses every query, so a redirect that goes through it
+	// fails, and the recorded dials show it was asked.
+	newResolver := func(asked *atomic.Int32) *net.Resolver {
+		return &net.Resolver{
+			PreferGo: true,
+			Dial: func(context.Context, string, string) (net.Conn, error) {
+				asked.Add(1)
+				return nil, errors.New("test resolver refused")
+			},
+		}
+	}
+
+	for name, opt := range map[string]func(*net.Resolver) []Option{
+		"with WithDialContext": func(r *net.Resolver) []Option {
+			return []Option{WithNoProxy(), WithDialContext(toServer), WithResolver(r)}
+		},
+		"with WithTransport": func(r *net.Resolver) []Option {
+			return []Option{WithTransport(&http.Transport{DialContext: toServer}), WithResolver(r)}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var asked atomic.Int32
+			opts := append(opt(newResolver(&asked)), WithNoRetries())
+			res, err := New(opts...).Get("http://a.invalid/")
+			if res != nil {
+				_ = res.Body.Close()
+			}
+			if !errors.Is(err, ErrBlockedByIPPolicy) {
+				t.Fatalf("err = %v, want ErrBlockedByIPPolicy", err)
+			}
+			if asked.Load() == 0 {
+				t.Fatal("redirect lookup did not use the configured resolver")
+			}
+		})
+	}
+}
